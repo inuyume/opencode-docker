@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "update": "disable",
+  "plugins": [
+    "file:///opt/opencode/plugins/node_modules/opencode-models-discovery/dist"
+  ],
+  "providers": {
+    "gateway": {
+      "name": "Custom API Gateway",
+      "package": "@opencode-ai/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "${OPENAI_BASE_URL}",
+        "apiKey": "${OPENAI_API_KEY}",
+        "modelsDiscovery": {
+          "enabled": true,
+          "endpoint": "/v1/models",
+          "timeoutMs": 15000
+        }
+      },
+      "models": {}
+    }
+  }
+}

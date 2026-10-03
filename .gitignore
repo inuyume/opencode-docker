@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+workspace/*
+!workspace/.gitkeep
+node_modules/
+__pycache__/
+*.pyc

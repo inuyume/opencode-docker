@@ -1,0 +1,23 @@
+services:
+  opencode:
+    image: ${OPENCODE_IMAGE:-ghcr.io/inuyume/opencode:latest}
+    command: ["opencode"]
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:?Set OPENAI_BASE_URL in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in .env}
+      TERM: xterm-256color
+    volumes:
+      - ./workspace:/workspace
+      - opencode-cli-config:/root/.config/opencode
+      - opencode-cli-cache:/root/.cache/opencode
+      - opencode-cli-data:/root/.local/share/opencode
+      - opencode-cli-state:/root/.local/state/opencode
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+volumes:
+  opencode-cli-config:
+  opencode-cli-cache:
+  opencode-cli-data:
+  opencode-cli-state:

@@ -1,0 +1,204 @@
+name: Build OpenCode v2 Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      opencode_version:
+        description: 'OpenCode v2 version, or latest'
+        required: true
+        default: '2.0.22'
+        type: string
+  # Optional daily rebuild at 02:17 UTC+8. Uncomment to enable.
+  # schedule:
+  #   - cron: '17 18 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      image: ${{ steps.settings.outputs.image }}
+      version: ${{ steps.settings.outputs.version }}
+      digest: ${{ steps.publish.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve image name and OpenCode version
+        id: settings
+        env:
+          OWNER: ${{ github.repository_owner }}
+          VERSION_INPUT: ${{ inputs.opencode_version || vars.OPENCODE_VERSION || '2.0.22' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          image="ghcr.io/${OWNER,,}/opencode"
+          version_spec="$VERSION_INPUT"
+          if [ "$EVENT_NAME" = schedule ]; then version_spec=latest; fi
+          if [[ "$version_spec" != latest && ! "$version_spec" =~ ^2\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Choose a stable 2.x.y version or latest.' >&2
+            exit 1
+          fi
+          version="$(npm view "@opencode/cli@$version_spec" version --registry=https://registry.npmjs.org)"
+          if [[ ! "$version" =~ ^2\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Resolved package is not a stable OpenCode v2 release.' >&2
+            exit 1
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Compose examples
+        run: |
+          docker compose --env-file .env.example config --quiet
+          docker compose --env-file .env.example -f compose.yaml -f compose.build.yaml config --quiet
+          docker compose --env-file .env.example -f compose.cli.yaml config --quiet
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: opencode-smoke:local
+          pull: true
+          build-args: |
+            OPENCODE_VERSION=${{ steps.settings.outputs.version }}
+          cache-from: type=gha,scope=opencode-v2
+          cache-to: type=gha,scope=opencode-v2,mode=max
+
+      - name: Test runtime and real plugin discovery
+        run: |
+          docker run --rm opencode-smoke:local python -c 'import sys; assert sys.version_info[:2] == (3, 11); assert sys.prefix == "/opt/venv"'
+          docker run --rm opencode-smoke:local python /opt/opencode/smoke.py
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        if: github.event_name != 'pull_request'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.settings.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha
+            type=raw,value=build-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.description=OpenCode v2 with Python 3.11 and preinstalled models discovery
+            io.opencode.version=${{ steps.settings.outputs.version }}
+            io.opencode.models-discovery.version=1.6.1
+
+      - name: Publish amd64 and arm64 image
+        if: github.event_name != 'pull_request'
+        id: publish
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          build-args: |
+            OPENCODE_VERSION=${{ steps.settings.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=opencode-v2
+          cache-to: type=gha,scope=opencode-v2,mode=max
+
+      - name: Build summary
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.settings.outputs.image }}
+          VERSION: ${{ steps.settings.outputs.version }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          {
+            echo "Image: $IMAGE"
+            echo "OpenCode v2: $VERSION"
+            echo "Digest: $DIGEST"
+            echo 'Platforms: linux/amd64, linux/arm64'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Export images to GitHub Release
+    needs: build
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Export exact published images as Docker tar archives
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          bash scripts/export-images.sh "$IMAGE" "$DIGEST" dist
+          printf 'Image: %s@%s\nOpenCode: %s\n' "$IMAGE" "$DIGEST" "$VERSION" > dist/image-digest.txt
+
+      - name: Create Release and upload image archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          {
+            printf 'OpenCode v2 Docker images for %s.\n\n' "$RELEASE_TAG"
+            printf 'OpenCode version: %s\n\n' "$VERSION"
+            printf 'Download the tar matching your CPU architecture, then run:\n\n'
+            printf '```bash\ndocker load -i opencode-linux-amd64.tar\n```\n\n'
+            printf 'For ARM64, use opencode-linux-arm64.tar instead.\n\n'
+            printf 'Loaded image tag: `%s:latest`\n\n' "$IMAGE"
+            printf 'Verify downloads with `sha256sum -c SHA256SUMS --ignore-missing`.\n'
+          } > release-notes.md
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/opencode-linux-amd64.tar dist/opencode-linux-arm64.tar dist/SHA256SUMS dist/image-digest.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/opencode-linux-amd64.tar dist/opencode-linux-arm64.tar dist/SHA256SUMS dist/image-digest.txt --verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md
+          fi
